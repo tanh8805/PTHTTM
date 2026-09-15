@@ -1,0 +1,4 @@
+outputs/
+uploads/
+*.mp4
+.venv/
