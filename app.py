@@ -3,16 +3,18 @@ FastAPI backend: nhận video upload, chạy model segmentation (best.pt)
 để nhận diện vùng ngập úng (class FLOOD), tô đỏ + viền rồi xuất video kết quả
 kèm thống kê và mức độ cảnh báo.
 
-Chạy:  .venv\Scripts\python.exe -m uvicorn app:app --host 0.0.0.0 --port 8000
+Chạy (Linux):  ~/.venvs/pthttm/bin/python -m uvicorn app:app --host 0.0.0.0 --port 8000
 """
 
 import shutil
+import subprocess
 import threading
 import time
 import uuid
 from pathlib import Path
 
 import cv2
+import imageio_ffmpeg
 import torch
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import FileResponse
@@ -51,13 +53,28 @@ def get_model() -> YOLO:
 
 
 def _make_writer(path: Path, fps: float, w: int, h: int):
-    """Tạo VideoWriter; ưu tiên H.264 (avc1) để trình duyệt xem được, fallback mp4v."""
-    for codec in ("avc1", "mp4v"):
+    """Tạo VideoWriter tạm (mp4v); sau đó sẽ transcode sang H.264 bằng ffmpeg."""
+    for codec in ("mp4v", "MJPG"):
         fourcc = cv2.VideoWriter_fourcc(*codec)
         writer = cv2.VideoWriter(str(path), fourcc, fps, (w, h))
         if writer.isOpened():
             return writer
     return None
+
+
+def _transcode_h264(src: Path, dst: Path) -> None:
+    """Chuyển video sang H.264 (yuv420p, +faststart) để trình duyệt phát được.
+
+    Dùng binary ffmpeg đi kèm gói imageio-ffmpeg, không cần ffmpeg của hệ thống.
+    """
+    cmd = [
+        imageio_ffmpeg.get_ffmpeg_exe(), "-y", "-loglevel", "error",
+        "-i", str(src),
+        "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+        "-pix_fmt", "yuv420p", "-movflags", "+faststart", "-an",
+        str(dst),
+    ]
+    subprocess.run(cmd, check=True, capture_output=True)
 
 # ---------------------------------------------------------------- processing
 def process_video(job_id: str, src_path: Path, dst_path: Path) -> None:
@@ -82,7 +99,10 @@ def process_video(job_id: str, src_path: Path, dst_path: Path) -> None:
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 0
 
-    writer = _make_writer(dst_path, fps, width, height)
+    tmp_path = dst_path.with_name(dst_path.stem + "_tmp.mp4")
+    writer = _make_writer(tmp_path, fps, width, height)
+    with _jobs_lock:
+        _jobs[job_id].update({"total_frames": total_frames, "frames_done": 0})
 
     model = get_model()
 
@@ -174,8 +194,24 @@ def process_video(job_id: str, src_path: Path, dst_path: Path) -> None:
     cap.release()
     if writer is not None:
         writer.release()
-    elif dst_path.exists():
-        dst_path.unlink()
+        with _jobs_lock:
+            _jobs[job_id].update({"message": "Đang mã hoá video H.264..."})
+        try:
+            _transcode_h264(tmp_path, dst_path)
+        except (subprocess.CalledProcessError, OSError) as exc:
+            err = getattr(exc, "stderr", b"") or b""
+            with _jobs_lock:
+                _jobs[job_id].update(
+                    {
+                        "status": "error",
+                        "progress": 0,
+                        "message": "Lỗi mã hoá video: "
+                                   + (err.decode(errors="ignore").strip() or str(exc)),
+                    }
+                )
+            return
+        finally:
+            tmp_path.unlink(missing_ok=True)
 
     # ---------------- thống kê & cảnh báo
     flood_ratio = (flood_frames / frame_idx * 100) if frame_idx else 0.0
@@ -196,6 +232,7 @@ def process_video(job_id: str, src_path: Path, dst_path: Path) -> None:
                 "status": "done",
                 "progress": 100,
                 "message": "Hoàn tất",
+                "frames_done": frame_idx,
                 "result": {
                     "output_url": f"/output/{dst_path.name}",
                     "output_name": dst_path.name,
@@ -239,6 +276,7 @@ async def upload_video(file: UploadFile = File(...)):
             "progress": 0,
             "message": "Đang chờ xử lý...",
             "filename": file.filename,
+            "source_url": f"/source/{src_path.name}",
             "result": None,
         }
 
@@ -266,6 +304,7 @@ def index():
 # mount tĩnh: frontend + video kết quả
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 app.mount("/output", StaticFiles(directory=OUTPUT_DIR), name="output")
+app.mount("/source", StaticFiles(directory=UPLOAD_DIR), name="source")
 
 
 if __name__ == "__main__":
