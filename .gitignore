@@ -1,6 +1,0 @@
-outputs/
-uploads/
-*.mp4
-.venv/
-__pycache__/
-.idea/

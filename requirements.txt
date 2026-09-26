@@ -1,7 +1,0 @@
-fastapi
-uvicorn[standard]
-python-multipart
-ultralytics
-opencv-python
-torch
-imageio-ffmpeg
