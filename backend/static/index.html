@@ -1,0 +1,175 @@
+<!doctype html>
+<html lang="vi">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Cảnh báo ngập</title>
+<style>
+  :root {
+    --bg: #f4f5f7; --card: #fff; --text: #1d2330; --muted: #677085; --line: #e1e4ea;
+    --l0: #28a046; --l1: #e0b000; --l2: #f57800; --l3: #d21e28;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text); font: 15px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  main { max-width: 1000px; margin: 0 auto; padding: 24px 16px 48px; }
+  h1 { font-size: 22px; margin: 0 0 16px; }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 16px; margin-bottom: 16px; }
+  .row { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+  button { background: #1d4ed8; color: #fff; border: 0; border-radius: 6px; padding: 8px 18px; font-size: 15px; cursor: pointer; }
+  button:disabled { opacity: .5; cursor: default; }
+  .progress { height: 10px; background: var(--line); border-radius: 5px; overflow: hidden; flex: 1; min-width: 160px; }
+  .progress > div { height: 100%; width: 0; background: #1d4ed8; transition: width .3s; }
+  .muted { color: var(--muted); font-size: 13px; }
+  .error { color: var(--l3); }
+  .badge { display: inline-block; color: #fff; font-weight: 700; border-radius: 6px; padding: 4px 12px; }
+  .badge.big { font-size: 22px; padding: 6px 16px; }
+  .lv0 { background: var(--l0); } .lv1 { background: var(--l1); } .lv2 { background: var(--l2); } .lv3 { background: var(--l3); }
+  .summary { display: flex; gap: 24px; flex-wrap: wrap; align-items: center; }
+  .summary div b { display: block; font-size: 18px; }
+  video { width: 100%; border-radius: 8px; background: #000; display: block; }
+  .timeline { position: relative; display: flex; height: 26px; border-radius: 5px; overflow: hidden; margin-top: 10px; cursor: pointer; }
+  .timeline > span { height: 100%; }
+  .timeline > span:hover { filter: brightness(1.15); }
+  .playhead { position: absolute; top: -2px; bottom: -2px; width: 3px; background: var(--text); left: 0; pointer-events: none; }
+  .ticks { display: flex; justify-content: space-between; margin-top: 2px; }
+  .now { margin-top: 12px; }
+  table { width: 100%; border-collapse: collapse; font-size: 14px; }
+  th, td { text-align: left; padding: 7px 8px; border-bottom: 1px solid var(--line); }
+  tbody tr { cursor: pointer; }
+  tbody tr:hover, tbody tr.active { background: #eef2ff; }
+  .legend { display: flex; flex-wrap: wrap; gap: 6px 16px; font-size: 13px; }
+  .legend i { display: inline-block; width: 12px; height: 12px; border-radius: 3px; margin-right: 5px; vertical-align: -1px; }
+  #result { display: none; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Cảnh báo ngập từ video camera đường phố</h1>
+
+  <div class="card">
+    <div class="row">
+      <input type="file" id="file" accept="video/*">
+      <button id="go" onclick="upload()">Phân tích</button>
+      <div class="progress"><div id="bar"></div></div>
+      <span id="status" class="muted"></span>
+    </div>
+  </div>
+
+  <div id="result">
+    <div class="card summary">
+      <div><span class="muted">Mức cao nhất trong video</span><br><span id="overall" class="badge big"></span></div>
+      <div><span class="muted">Thời lượng</span><b id="duration"></b></div>
+      <div><span class="muted">Ngập mặt đường cao nhất</span><b id="floodmax"></b></div>
+      <div><span class="muted">Xe ngập cao nhất</span><b id="carmax"></b></div>
+    </div>
+
+    <div class="card">
+      <video id="video" controls playsinline></video>
+      <div class="timeline" id="timeline"><div class="playhead" id="playhead"></div></div>
+      <div class="ticks muted"><span>0s</span><span id="endtick"></span></div>
+      <div class="now">Đang xem: <span id="now" class="badge"></span> <span id="nowinfo" class="muted"></span></div>
+    </div>
+
+    <div class="card">
+      <b>Các giai đoạn</b> <span class="muted">(bấm để tua tới)</span>
+      <div style="overflow-x:auto"><table>
+        <thead><tr><th>Thời gian</th><th>Mức cảnh báo</th><th>Ngập mặt đường (max)</th><th>Xe ngập (max)</th></tr></thead>
+        <tbody id="phases"></tbody>
+      </table></div>
+    </div>
+
+    <div class="card legend">
+      <b>Màu mask:</b>
+      <span><i style="background:#1478e6"></i>flood</span>
+      <span><i style="background:#969696"></i>road</span>
+      <span><i style="background:#50c850"></i>car_L0</span>
+      <span><i style="background:#c8dc3c"></i>car_L1</span>
+      <span><i style="background:#ffd700"></i>car_L2</span>
+      <span><i style="background:#ff8c00"></i>car_L3</span>
+      <span><i style="background:#e62828"></i>car_L4</span>
+    </div>
+  </div>
+</main>
+
+<script>
+const $ = id => document.getElementById(id);
+const fmt = s => s.toFixed(1) + "s";
+const pct = r => Math.round(r * 100) + "%";
+const car = l => l === null ? "không có xe" : "L" + l;
+let phases = [];
+
+async function upload() {
+  const f = $("file").files[0];
+  if (!f) return;
+  $("go").disabled = true; $("result").style.display = "none"; $("status").className = "muted";
+  $("bar").style.width = "0"; $("status").textContent = "Đang tải lên...";
+  const fd = new FormData(); fd.append("file", f);
+  try {
+    const r = await fetch("/analyze", { method: "POST", body: fd });
+    const j = await r.json();
+    if (!r.ok) throw new Error(j.detail);
+    poll(j.job_id);
+  } catch (e) { fail(e.message); }
+}
+
+async function poll(id) {
+  try {
+    const j = await (await fetch("/jobs/" + id)).json();
+    $("bar").style.width = (j.progress * 100) + "%";
+    if (j.status === "error") return fail(j.error);
+    if (j.status === "done") { $("status").textContent = "Xong"; $("go").disabled = false; return show(j); }
+    $("status").textContent = (j.status === "queued" ? "Đang chờ" : "Đang phân tích") + " " + Math.round(j.progress * 100) + "%";
+    setTimeout(() => poll(id), 1000);
+  } catch (e) { fail(e.message); }
+}
+
+function fail(msg) { $("status").textContent = "Lỗi: " + msg; $("status").className = "error"; $("go").disabled = false; }
+
+function show(job) {
+  const r = job.result;
+  phases = r.phases;
+  $("result").style.display = "block";
+  $("overall").textContent = "Mức " + r.warning_level + ": " + r.warning;
+  $("overall").className = "badge big lv" + r.warning_level;
+  $("duration").textContent = fmt(r.duration_s);
+  $("floodmax").textContent = pct(r.flood_ratio_max);
+  $("carmax").textContent = car(r.car_level_max);
+  $("endtick").textContent = fmt(r.duration_s);
+  $("video").src = job.video_url;
+
+  const tl = $("timeline");
+  tl.querySelectorAll("span").forEach(e => e.remove());
+  $("phases").innerHTML = "";
+  phases.forEach((p, i) => {
+    const seg = document.createElement("span");
+    seg.className = "lv" + p.level;
+    seg.style.width = ((p.end_s - p.start_s) / r.duration_s * 100) + "%";
+    seg.title = `${fmt(p.start_s)} – ${fmt(p.end_s)}: Mức ${p.level} ${p.warning}`;
+    tl.insertBefore(seg, $("playhead"));
+    const tr = document.createElement("tr");
+    tr.innerHTML = `<td>${fmt(p.start_s)} – ${fmt(p.end_s)}</td>
+      <td><span class="badge lv${p.level}">Mức ${p.level}: ${p.warning}</span></td>
+      <td>${pct(p.flood_ratio_max)}</td><td>${car(p.car_level_max)}</td>`;
+    tr.onclick = () => seek(p.start_s);
+    $("phases").appendChild(tr);
+  });
+  tl.onclick = e => { const b = tl.getBoundingClientRect(); seek((e.clientX - b.left) / b.width * r.duration_s); };
+  update(0, r.duration_s);
+  $("video").ontimeupdate = () => update($("video").currentTime, r.duration_s);
+}
+
+function seek(t) { $("video").currentTime = t; $("video").play(); }
+
+function update(t, dur) {
+  $("playhead").style.left = Math.min(t / dur * 100, 100) + "%";
+  let i = phases.findIndex(p => t < p.end_s);
+  if (i < 0) i = phases.length - 1;
+  const p = phases[i];
+  $("now").textContent = "Mức " + p.level + ": " + p.warning;
+  $("now").className = "badge lv" + p.level;
+  $("nowinfo").textContent = `giai đoạn ${fmt(p.start_s)} – ${fmt(p.end_s)}`;
+  document.querySelectorAll("#phases tr").forEach((tr, k) => tr.classList.toggle("active", k === i));
+}
+</script>
+</body>
+</html>

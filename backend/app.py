@@ -1,28 +1,54 @@
-"""Backend đơn giản: upload video -> trả về mức cảnh báo ngập.
+"""Backend đơn giản: upload video -> video segmentation + mức cảnh báo ngập theo từng giai đoạn.
 
 Chạy:  uvicorn app:app --host 0.0.0.0 --port 8000
 Mở http://localhost:8000 để upload bằng trình duyệt, hoặc xem API ở http://localhost:8000/docs
 """
 import os
-import shutil
-import tempfile
+import json
+import uuid
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI, File, HTTPException, UploadFile
-from fastapi.concurrency import run_in_threadpool
-from fastapi.responses import HTMLResponse
+from fastapi.responses import FileResponse
 
 import analyzer
 
-MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "200"))
+MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "500"))
 VIDEO_EXTS = {".mp4", ".avi", ".mov", ".mkv", ".webm", ".m4v"}
+OUTPUT_DIR = Path(os.getenv("OUTPUT_DIR", Path(__file__).parent / "outputs"))
+STATIC_DIR = Path(__file__).parent / "static"
 
-app = FastAPI(title="Cảnh báo ngập từ video")
+JOBS = {}                                    # job_id -> trạng thái (mất khi tắt server)
+executor = ThreadPoolExecutor(max_workers=1)  # xử lý lần lượt từng video
 
 
-@app.on_event("startup")
-def load_model():
+@asynccontextmanager
+async def lifespan(app):
     analyzer.get_model()  # nạp model 1 lần khi khởi động, báo lỗi sớm nếu thiếu best.pt
+    yield
+
+
+app = FastAPI(title="Cảnh báo ngập từ video", lifespan=lifespan)
+
+
+def run_job(job_id, video_path):
+    job = JOBS[job_id]
+    job["status"] = "running"
+    out_dir = OUTPUT_DIR / job_id
+    try:
+        result = analyzer.process_video(video_path, out_dir / "result.mp4",
+                                        progress=lambda p: job.update(progress=round(p, 3)))
+        (out_dir / "result.json").write_text(json.dumps(result, ensure_ascii=False, indent=1), encoding="utf-8")
+        result.pop("frames")
+        job.update(status="done", progress=1.0, result=result, video_url=f"/jobs/{job_id}/video")
+    except ValueError as e:
+        job.update(status="error", error=str(e))
+    except Exception as e:
+        job.update(status="error", error=f"{type(e).__name__}: {e}")
+    finally:
+        os.remove(video_path)
 
 
 @app.get("/health")
@@ -31,42 +57,42 @@ def health():
 
 
 @app.post("/analyze")
-async def analyze(file: UploadFile = File(...), include_frames: bool = False):
+def analyze(file: UploadFile = File(...)):
     ext = Path(file.filename or "").suffix.lower()
     if ext not in VIDEO_EXTS:
         raise HTTPException(400, f"Chỉ nhận video {sorted(VIDEO_EXTS)}")
-    with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as tmp:
-        shutil.copyfileobj(file.file, tmp)
-        path = tmp.name
-    try:
-        if os.path.getsize(path) > MAX_UPLOAD_MB * 1024 * 1024:
-            raise HTTPException(413, f"Video quá {MAX_UPLOAD_MB}MB")
-        result = await run_in_threadpool(analyzer.analyze_video, path)
-    except ValueError as e:
-        raise HTTPException(400, str(e))
-    finally:
-        os.remove(path)
-    if not include_frames:
-        result.pop("frames")
-    return {"filename": file.filename, **result}
+    job_id = uuid.uuid4().hex[:12]
+    out_dir = OUTPUT_DIR / job_id
+    out_dir.mkdir(parents=True)
+    video_path = out_dir / f"input{ext}"
+    size, limit = 0, MAX_UPLOAD_MB * 1024 * 1024
+    with open(video_path, "wb") as f:
+        while chunk := file.file.read(1024 * 1024):
+            size += len(chunk)
+            if size > limit:
+                f.close()
+                os.remove(video_path)
+                raise HTTPException(413, f"Video quá {MAX_UPLOAD_MB}MB")
+            f.write(chunk)
+    JOBS[job_id] = {"job_id": job_id, "filename": file.filename, "status": "queued", "progress": 0.0}
+    executor.submit(run_job, job_id, video_path)
+    return {"job_id": job_id, "status_url": f"/jobs/{job_id}"}
 
 
-@app.get("/", response_class=HTMLResponse)
+@app.get("/jobs/{job_id}")
+def job_status(job_id: str):
+    if job_id not in JOBS:
+        raise HTTPException(404, "Không có job này")
+    return JOBS[job_id]
+
+
+@app.get("/jobs/{job_id}/video")
+def job_video(job_id: str):
+    if JOBS.get(job_id, {}).get("status") != "done":
+        raise HTTPException(404, "Video chưa xử lý xong")
+    return FileResponse(OUTPUT_DIR / job_id / "result.mp4", media_type="video/mp4")
+
+
+@app.get("/")
 def index():
-    return """<!doctype html><meta charset="utf-8"><title>Cảnh báo ngập</title>
-<body style="font-family:sans-serif;max-width:640px;margin:40px auto;padding:0 16px">
-<h2>Upload video camera đường phố</h2>
-<input type="file" id="f" accept="video/*"> <button onclick="go()">Phân tích</button>
-<h1 id="lv"></h1><pre id="out"></pre>
-<script>
-const colors=["green","goldenrod","darkorange","red"];
-async function go(){
-  const f=document.getElementById('f').files[0]; if(!f) return;
-  const fd=new FormData(); fd.append('file',f);
-  lv.textContent='Đang phân tích...'; lv.style.color='gray'; out.textContent='';
-  const r=await fetch('/analyze',{method:'POST',body:fd}); const j=await r.json();
-  if(!r.ok){lv.textContent='Lỗi'; lv.style.color='red'; out.textContent=j.detail; return;}
-  lv.textContent='Mức '+j.warning_level+': '+j.warning; lv.style.color=colors[j.warning_level];
-  out.textContent=JSON.stringify(j,null,2);
-}
-</script></body>"""
+    return FileResponse(STATIC_DIR / "index.html")
