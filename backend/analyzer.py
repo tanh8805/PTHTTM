@@ -115,13 +115,12 @@ def frame_stats(instances, h, w):
     flood_px, road_px = int(flood.sum()), int(road.sum())
     # Tỉ lệ ngập so với mặt đường nhìn thấy; thấy quá ít đường (đường ngập hết hoặc model
     # không nhận ra) thì so với cả khung hình, tránh vũng nước nhỏ thành tỉ lệ 100%.
-    if road_px >= 0.05 * h * w:
-        flood_ratio = flood_px / (flood_px + road_px)
-    else:
-        flood_ratio = flood_px / (h * w)
+    road_visible = road_px >= 0.05 * h * w
+    flood_ratio = flood_px / (flood_px + road_px) if road_visible else flood_px / (h * w)
     max_car = max(cars, default=None)
     return {
         "flood_ratio": round(flood_ratio, 3),
+        "road_visible": road_visible,
         "cars": len(cars),
         "max_car_level": max_car,
         "level": level_of(flood_ratio, max_car),
@@ -141,19 +140,32 @@ def max_or_none(values):
 # ---------------- Vẽ lên video ----------------
 
 def _find_font():
-    candidates = [
-        os.getenv("FONT_PATH", ""),
-        "C:/Windows/Fonts/arialbd.ttf", "C:/Windows/Fonts/arial.ttf", "C:/Windows/Fonts/segoeui.ttf",
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-        "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
-        "/System/Library/Fonts/Supplemental/Arial Bold.ttf", "/Library/Fonts/Arial Unicode.ttf",
-    ]
+    env = os.getenv("FONT_PATH", "")
+    if env and Path(env).exists():
+        return env
+    # matplotlib (luôn được cài cùng ultralytics) có sẵn DejaVu Sans, hiển thị đủ dấu tiếng Việt
     try:
-        from ultralytics.utils import USER_CONFIG_DIR
-        candidates += [str(USER_CONFIG_DIR / "Arial.Unicode.ttf"), str(USER_CONFIG_DIR / "Arial.ttf")]
+        import matplotlib
+        p = Path(matplotlib.get_data_path()) / "fonts" / "ttf" / "DejaVuSans-Bold.ttf"
+        if p.exists():
+            return str(p)
     except Exception:
         pass
-    return next((c for c in candidates if c and Path(c).exists()), None)
+    candidates = [
+        "C:/Windows/Fonts/arialbd.ttf", "C:/Windows/Fonts/arial.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", "/usr/share/fonts/TTF/DejaVuSans-Bold.ttf",
+        "/System/Library/Fonts/Supplemental/Arial Bold.ttf",
+    ]
+    return next((c for c in candidates if Path(c).exists()), None)
+
+
+def _font(size):
+    if FONT_FILE:
+        return ImageFont.truetype(FONT_FILE, size)
+    try:
+        return ImageFont.load_default(size)  # Pillow >= 10.1
+    except TypeError:
+        return ImageFont.load_default()
 
 
 FONT_FILE = _find_font()
@@ -175,8 +187,8 @@ def banner(width, level, line2):
     b, g, r = LEVELS[level][4]
     img = Image.new("RGB", (width, height), (r, g, b))
     draw = ImageDraw.Draw(img)
-    big = ImageFont.truetype(FONT_FILE, int(30 * scale)) if FONT_FILE else ImageFont.load_default()
-    small = ImageFont.truetype(FONT_FILE, int(18 * scale)) if FONT_FILE else ImageFont.load_default()
+    big = _font(int(30 * scale))
+    small = _font(int(18 * scale))
     draw.text((int(14 * scale), int(5 * scale)), vn_text(f"MỨC {level}: {LEVELS[level][1].upper()}"), font=big, fill=(255, 255, 255))
     draw.text((int(14 * scale), int(42 * scale)), vn_text(line2), font=small, fill=(255, 255, 255))
     return cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
@@ -224,7 +236,8 @@ def render_frame(frame, overlay, level, stats):
             cv2.putText(out, text, (x + 2, y - 3), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1, cv2.LINE_AA)
     draw_legend(out)
     car = "không có xe" if stats["max_car_level"] is None else f"L{stats['max_car_level']}"
-    top = banner(out.shape[1], level, f"Ngập {stats['flood_ratio']:.0%} mặt đường · Xe ngập cao nhất: {car}")
+    base = "mặt đường" if stats["road_visible"] else "khung hình (không thấy đường)"
+    top = banner(out.shape[1], level, f"Ngập {stats['flood_ratio']:.0%} {base} · Xe ngập cao nhất: {car}")
     return np.vstack([top, out])
 
 
