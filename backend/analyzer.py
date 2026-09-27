@@ -27,6 +27,7 @@ MIN_FRAME_FRAC = float(os.getenv("MIN_FRAME_FRAC", "0.5"))  # mức của đoạ
 ROAD_MIN_FRAC = float(os.getenv("ROAD_MIN_FRAC", "0.05"))              # đường chiếm >= 5% khung hình mới coi là thấy đường
 FLOOD_COVER_MIN_FRAC = float(os.getenv("FLOOD_COVER_MIN_FRAC", "0.10"))  # không thấy đường mà nước >= 10% khung hình -> đường bị phủ kín
 LEVEL_HOLD_SECONDS = float(os.getenv("LEVEL_HOLD_SECONDS", "6"))  # mức chỉ được giảm khi đã thấp hơn liên tục 6 giây (0 = tắt)
+SCENE_CUT = float(os.getenv("SCENE_CUT", "0.6"))  # khác biệt màu so với ~1 giây trước vượt ngưỡng này -> chuyển cảnh (1 = tắt)
 MASK_SMOOTH = float(os.getenv("MASK_SMOOTH", "0.6"))  # trọng số lịch sử khi làm mượt mask flood/road giữa các lần chạy model (0 = tắt)
 CAR_HISTORY = int(os.getenv("CAR_HISTORY", "7"))       # level xe = level xuất hiện nhiều nhất trong 7 lần chạy model gần nhất
 OUT_WIDTH = int(os.getenv("OUT_WIDTH", "960"))        # chiều rộng video kết quả (thu nhỏ cho nhẹ)
@@ -144,10 +145,12 @@ def segment_level(stats):
     return max(code for code, *_ in LEVELS if code == 0 or sum(s["level"] >= code for s in stats) / n >= MIN_FRAME_FRAC)
 
 
-def held_level(raw, start_s, prev_segments):
+def held_level(raw, start_s, scene, prev_segments):
     """Nước không rút trong vài giây: mức tăng ngay, nhưng chỉ giảm khi các đoạn trong
-    LEVEL_HOLD_SECONDS giây trước đều thấp hơn. Lấp các đoạn model sót nước (bị che, nhận nhầm)."""
-    recent = [p["raw_level"] for p in prev_segments if p["end_s"] > start_s - LEVEL_HOLD_SECONDS]
+    LEVEL_HOLD_SECONDS giây trước đều thấp hơn. Lấp các đoạn model sót nước (bị che, nhận nhầm).
+    Chỉ giữ trong cùng một cảnh: sang cảnh khác (logo, trường quay...) thì không kéo mức cũ sang."""
+    recent = [p["raw_level"] for p in prev_segments
+              if p["scene"] == scene and p["end_s"] > start_s - LEVEL_HOLD_SECONDS]
     return max([raw] + recent)
 
 
@@ -157,6 +160,25 @@ def max_or_none(values):
 
 
 # ---------------- Làm mượt theo thời gian ----------------
+
+class SceneCutDetector:
+    """Phát hiện chuyển cảnh (video tin tức cắt ghép) bằng histogram màu HSV: so khung hình hiện tại với
+    khung hình ~1 giây trước trong cùng cảnh, để bắt được cả cắt thẳng lẫn chuyển mờ dần.
+    Ngưỡng cao để người/xe đi ngang che camera hay camera rung không bị tính là chuyển cảnh."""
+
+    def __init__(self, window):
+        self.hists = deque(maxlen=max(1, window))
+
+    def update(self, frame):
+        hsv = cv2.cvtColor(cv2.resize(frame, (160, 90), interpolation=cv2.INTER_AREA), cv2.COLOR_BGR2HSV)
+        hist = cv2.calcHist([hsv], [0, 1, 2], None, [16, 4, 4], [0, 180, 0, 256, 0, 256])
+        cv2.normalize(hist, hist)
+        cut = bool(self.hists) and cv2.compareHist(self.hists[0], hist, cv2.HISTCMP_BHATTACHARYYA) > SCENE_CUT
+        if cut:
+            self.hists.clear()
+        self.hists.append(hist)
+        return cut
+
 
 def box_iou(a, b):
     ix = max(0, min(a[2], b[2]) - max(a[0], b[0]))
@@ -347,7 +369,7 @@ def render_frame(frame, ov_a, ov_b, t, level, stats, held=False):
             "frame": "khung hình (không thấy đường)"}[stats["ratio_base"]]
     line2 = f"Ngập {stats['flood_ratio']:.0%} {base} · Xe ngập cao nhất: {car}"
     if held:
-        line2 = f"Giữ mức do vừa ngập vài giây trước · hiện thấy: ngập {stats['flood_ratio']:.0%}, xe {car}"
+        line2 = f"Giữ mức do vừa ngập vài giây trước · hiện thấy: ngập {stats['flood_ratio']:.0%}, xe: {car}"
     top = banner(out.shape[1], level, line2)
     return np.vstack([top, out])
 
@@ -386,6 +408,8 @@ def process_video(video_path, out_path, progress=None):
     pending = []   # khung hình từ lần chạy model trước tới trước lần chạy kế tiếp (chờ để hòa trộn mask)
     prev = None    # (overlay, stats) của lần chạy model trước
     smoother = TemporalSmoother()
+    scenes = SceneCutDetector(round(INFER_FPS))
+    scene = 0
     writer = open_writer(out_path, w, h + banner(w, 0, "").shape[0], fps)
     idx = seg_start = 0
 
@@ -397,10 +421,11 @@ def process_video(video_path, out_path, progress=None):
         if not cur:
             cur = [max(((f, i) for f, i in zip(frames, kf_index) if i < end), key=lambda x: x[1])[0]]
         raw = segment_level(cur)
-        level = held_level(raw, round(seg_start / fps, 2), segments)
+        seg_scene = cur[-1]["scene"]
+        level = held_level(raw, round(seg_start / fps, 2), seg_scene, segments)
         segments.append({
             "start_s": round(seg_start / fps, 2), "end_s": round(end / fps, 2),
-            "level": level, "warning": LEVELS[level][1], "raw_level": raw,
+            "level": level, "warning": LEVELS[level][1], "raw_level": raw, "scene": seg_scene,
             "flood_ratio_max": max(s["flood_ratio"] for s in cur),
             "car_level_max": max_or_none(s["max_car_level"] for s in cur),
         })
@@ -428,9 +453,15 @@ def process_video(video_path, out_path, progress=None):
                     break
                 frame = cv2.resize(frame, (w, h), interpolation=cv2.INTER_AREA)
                 if idx % infer_every == 0:
+                    if scenes.update(frame):
+                        # cảnh mới: không hòa trộn mask từ cảnh cũ, bỏ lịch sử làm mượt mask/xe
+                        if prev is not None:
+                            emit(prev)
+                        smoother = TemporalSmoother()
+                        scene += 1
                     r = model.predict(frame, conf=CONF, imgsz=IMG_SIZE, retina_masks=True, verbose=False)[0]
                     instances = smoother.update(parse_result(r, cmap), h, w)
-                    stats = {"time_s": round(idx / fps, 2), **frame_stats(instances, h, w)}
+                    stats = {"time_s": round(idx / fps, 2), "scene": scene, **frame_stats(instances, h, w)}
                     frames.append(stats)
                     kf_index.append(idx)
                     cur = (build_overlay(instances, h, w), stats)
@@ -470,6 +501,7 @@ def process_video(video_path, out_path, progress=None):
                               for c in range(len(LEVELS))},
         "flood_ratio_max": max(f["flood_ratio"] for f in frames),
         "car_level_max": max_or_none(f["max_car_level"] for f in frames),
+        "scene_cuts": [f["time_s"] for k, f in enumerate(frames) if k and f["scene"] != frames[k - 1]["scene"]],
         "phases": phases,
         "segments": segments,
         "frames": frames,
