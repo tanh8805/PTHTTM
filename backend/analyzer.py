@@ -24,6 +24,8 @@ IMG_SIZE = int(os.getenv("IMG_SIZE", "640"))
 INFER_FPS = float(os.getenv("INFER_FPS", "5"))        # số lần chạy model mỗi giây video; khung hình ở giữa dùng lại mask gần nhất
 SEGMENT_SECONDS = float(os.getenv("SEGMENT_SECONDS", "2"))  # độ dài mỗi đoạn để tính mức cảnh báo
 MIN_FRAME_FRAC = float(os.getenv("MIN_FRAME_FRAC", "0.5"))  # mức của đoạn = mức cao nhất mà >= 50% khung hình trong đoạn đạt
+ROAD_MIN_FRAC = float(os.getenv("ROAD_MIN_FRAC", "0.05"))              # đường chiếm >= 5% khung hình mới coi là thấy đường
+FLOOD_COVER_MIN_FRAC = float(os.getenv("FLOOD_COVER_MIN_FRAC", "0.10"))  # không thấy đường mà nước >= 10% khung hình -> đường bị phủ kín
 MASK_SMOOTH = float(os.getenv("MASK_SMOOTH", "0.6"))  # trọng số lịch sử khi làm mượt mask flood/road giữa các lần chạy model (0 = tắt)
 CAR_HISTORY = int(os.getenv("CAR_HISTORY", "7"))       # level xe = level xuất hiện nhiều nhất trong 7 lần chạy model gần nhất
 OUT_WIDTH = int(os.getenv("OUT_WIDTH", "960"))        # chiều rộng video kết quả (thu nhỏ cho nhẹ)
@@ -116,14 +118,20 @@ def frame_stats(instances, h, w):
             cars.append(inst["level"])
     road &= ~flood
     flood_px, road_px = int(flood.sum()), int(road.sum())
-    # Tỉ lệ ngập so với mặt đường nhìn thấy; thấy quá ít đường (đường ngập hết hoặc model
-    # không nhận ra) thì so với cả khung hình, tránh vũng nước nhỏ thành tỉ lệ 100%.
-    road_visible = road_px >= 0.05 * h * w
-    flood_ratio = flood_px / (flood_px + road_px) if road_visible else flood_px / (h * w)
+    # Tỉ lệ ngập so với mặt đường nhìn thấy. Khi thấy rất ít đường:
+    #  - nước nhiều (>= FLOOD_COVER_MIN_FRAC khung hình): đường đã bị nước phủ kín -> vẫn tính trên mặt đường (~100%)
+    #  - nước ít: chỉ là vũng nước (model sót đường) -> tính trên cả khung hình, tránh vũng nhỏ thành 100%
+    if road_px >= ROAD_MIN_FRAC * h * w:
+        ratio_base = "road"
+    elif flood_px >= FLOOD_COVER_MIN_FRAC * h * w:
+        ratio_base = "covered"
+    else:
+        ratio_base = "frame"
+    flood_ratio = flood_px / (h * w) if ratio_base == "frame" else flood_px / (flood_px + road_px)
     max_car = max(cars, default=None)
     return {
         "flood_ratio": round(flood_ratio, 3),
-        "road_visible": road_visible,
+        "ratio_base": ratio_base,
         "cars": len(cars),
         "max_car_level": max_car,
         "level": level_of(flood_ratio, max_car),
@@ -327,7 +335,8 @@ def render_frame(frame, ov_a, ov_b, t, level, stats):
         cv2.putText(out, text, (x + 2, y - 3), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1, cv2.LINE_AA)
     draw_legend(out)
     car = "không có xe" if stats["max_car_level"] is None else f"L{stats['max_car_level']}"
-    base = "mặt đường" if stats["road_visible"] else "khung hình (không thấy đường)"
+    base = {"road": "mặt đường", "covered": "mặt đường (nước phủ kín, không còn thấy đường)",
+            "frame": "khung hình (không thấy đường)"}[stats["ratio_base"]]
     top = banner(out.shape[1], level, f"Ngập {stats['flood_ratio']:.0%} {base} · Xe ngập cao nhất: {car}")
     return np.vstack([top, out])
 

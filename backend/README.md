@@ -36,7 +36,9 @@ uvicorn app:app --host 0.0.0.0 --port 8000
    - **xe**: nối xe giữa các lần chạy theo IoU box. Level là level xuất hiện nhiều nhất trong 7 lần gần nhất (hòa thì lấy level cao hơn). Xe bị sót 1 lần vẫn được giữ lại.
    - **khung hình ở giữa 2 lần chạy**: mask flood/road chuyển dần từ lần chạy trước sang lần chạy sau, thay vì đứng yên rồi nhảy.
 2. Với mỗi khung hình được chạy model:
-   - `flood_ratio` = diện tích flood / (flood + road). Nếu thấy ít đường (< 5% khung hình) thì chia cho cả khung hình.
+   - `flood_ratio` = diện tích flood / (flood + road). Khi thấy rất ít đường (< 5% khung hình):
+     - nếu nước chiếm ≥ 10% khung hình thì coi như đường đã bị nước phủ kín, vẫn chia cho (flood + road), ra gần 100%;
+     - nếu nước ít hơn thì chỉ là vũng nước (model sót đường), chia cho cả khung hình để vũng nhỏ không thành 100%.
    - `max_car_level` = level cao nhất của xe (car_L0…car_L4; level càng cao thì nước càng sâu).
    - Khung hình đạt một mức nếu thỏa **một trong hai** điều kiện:
 
@@ -58,6 +60,8 @@ Ngưỡng nằm trong `LEVELS` của `analyzer.py`, sửa theo thực tế. Các
 | `MODEL_PATH` | `weights/best.pt` | đường dẫn model |
 | `CONF` | 0.5 | confidence tối thiểu |
 | `INFER_FPS` | 5 | số lần chạy model mỗi giây video (giảm nếu máy chậm; có GPU thì đặt bằng fps của video để mượt nhất) |
+| `ROAD_MIN_FRAC` | 0.05 | đường chiếm ít nhất bao nhiêu khung hình mới coi là thấy đường |
+| `FLOOD_COVER_MIN_FRAC` | 0.10 | không thấy đường mà nước chiếm ít nhất bao nhiêu khung hình thì coi là đường bị phủ kín |
 | `MASK_SMOOTH` | 0.6 | mức làm mượt mask flood/road (0 = tắt, càng lớn càng mượt nhưng trễ hơn) |
 | `CAR_HISTORY` | 7 | số lần chạy gần nhất dùng để chốt level xe |
 | `SEGMENT_SECONDS` | 2 | độ dài mỗi đoạn tính mức |
