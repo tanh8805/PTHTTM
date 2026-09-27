@@ -1,0 +1,3 @@
+# Đặt best.pt (tải từ output notebook train trên Kaggle) vào thư mục này; không commit file weight.
+*
+!.gitignore
