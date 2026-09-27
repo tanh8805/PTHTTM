@@ -26,6 +26,7 @@ SEGMENT_SECONDS = float(os.getenv("SEGMENT_SECONDS", "2"))  # độ dài mỗi �
 MIN_FRAME_FRAC = float(os.getenv("MIN_FRAME_FRAC", "0.5"))  # mức của đoạn = mức cao nhất mà >= 50% khung hình trong đoạn đạt
 ROAD_MIN_FRAC = float(os.getenv("ROAD_MIN_FRAC", "0.05"))              # đường chiếm >= 5% khung hình mới coi là thấy đường
 FLOOD_COVER_MIN_FRAC = float(os.getenv("FLOOD_COVER_MIN_FRAC", "0.10"))  # không thấy đường mà nước >= 10% khung hình -> đường bị phủ kín
+LEVEL_HOLD_SECONDS = float(os.getenv("LEVEL_HOLD_SECONDS", "6"))  # mức chỉ được giảm khi đã thấp hơn liên tục 6 giây (0 = tắt)
 MASK_SMOOTH = float(os.getenv("MASK_SMOOTH", "0.6"))  # trọng số lịch sử khi làm mượt mask flood/road giữa các lần chạy model (0 = tắt)
 CAR_HISTORY = int(os.getenv("CAR_HISTORY", "7"))       # level xe = level xuất hiện nhiều nhất trong 7 lần chạy model gần nhất
 OUT_WIDTH = int(os.getenv("OUT_WIDTH", "960"))        # chiều rộng video kết quả (thu nhỏ cho nhẹ)
@@ -141,6 +142,13 @@ def frame_stats(instances, h, w):
 def segment_level(stats):
     n = len(stats)
     return max(code for code, *_ in LEVELS if code == 0 or sum(s["level"] >= code for s in stats) / n >= MIN_FRAME_FRAC)
+
+
+def held_level(raw, start_s, prev_segments):
+    """Nước không rút trong vài giây: mức tăng ngay, nhưng chỉ giảm khi các đoạn trong
+    LEVEL_HOLD_SECONDS giây trước đều thấp hơn. Lấp các đoạn model sót nước (bị che, nhận nhầm)."""
+    recent = [p["raw_level"] for p in prev_segments if p["end_s"] > start_s - LEVEL_HOLD_SECONDS]
+    return max([raw] + recent)
 
 
 def max_or_none(values):
@@ -310,7 +318,7 @@ def draw_legend(img):
         cv2.putText(img, name, (32, y + 13), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1, cv2.LINE_AA)
 
 
-def render_frame(frame, ov_a, ov_b, t, level, stats):
+def render_frame(frame, ov_a, ov_b, t, level, stats, held=False):
     """Vẽ khung hình nằm giữa 2 lần chạy model: vùng flood/road hòa trộn dần từ ov_a sang ov_b
     (t = 0..1) để mask không đứng yên rồi nhảy; xe, viền, nhãn lấy theo lần chạy gần hơn."""
     near = ov_a if t < 0.5 else ov_b
@@ -337,7 +345,10 @@ def render_frame(frame, ov_a, ov_b, t, level, stats):
     car = "không có xe" if stats["max_car_level"] is None else f"L{stats['max_car_level']}"
     base = {"road": "mặt đường", "covered": "mặt đường (nước phủ kín, không còn thấy đường)",
             "frame": "khung hình (không thấy đường)"}[stats["ratio_base"]]
-    top = banner(out.shape[1], level, f"Ngập {stats['flood_ratio']:.0%} {base} · Xe ngập cao nhất: {car}")
+    line2 = f"Ngập {stats['flood_ratio']:.0%} {base} · Xe ngập cao nhất: {car}"
+    if held:
+        line2 = f"Giữ mức do vừa ngập vài giây trước · hiện thấy: ngập {stats['flood_ratio']:.0%}, xe {car}"
+    top = banner(out.shape[1], level, line2)
     return np.vstack([top, out])
 
 
@@ -385,15 +396,16 @@ def process_video(video_path, out_path, progress=None):
         cur = [f for f, i in zip(frames, kf_index) if seg_start <= i < end]
         if not cur:
             cur = [max(((f, i) for f, i in zip(frames, kf_index) if i < end), key=lambda x: x[1])[0]]
-        level = segment_level(cur)
+        raw = segment_level(cur)
+        level = held_level(raw, round(seg_start / fps, 2), segments)
         segments.append({
             "start_s": round(seg_start / fps, 2), "end_s": round(end / fps, 2),
-            "level": level, "warning": LEVELS[level][1],
+            "level": level, "warning": LEVELS[level][1], "raw_level": raw,
             "flood_ratio_max": max(s["flood_ratio"] for s in cur),
             "car_level_max": max_or_none(s["max_car_level"] for s in cur),
         })
         for frame, ov_a, ov_b, t, st in buf:
-            writer.send(np.ascontiguousarray(render_frame(frame, ov_a, ov_b, t, level, st)))
+            writer.send(np.ascontiguousarray(render_frame(frame, ov_a, ov_b, t, level, st, held=level > raw)))
         buf.clear()
         seg_start = end
 

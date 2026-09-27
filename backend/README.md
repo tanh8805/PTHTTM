@@ -50,8 +50,10 @@ uvicorn app:app --host 0.0.0.0 --port 8000
    | 3 | Nguy hiểm | 0.60 | L3 |
 
 3. Chia video thành từng **đoạn 2 giây** (`SEGMENT_SECONDS`). Mức của một đoạn là mức cao nhất mà ít nhất 50% khung hình trong đoạn đạt được. Cách này giúp vài khung hình nhận nhầm không làm mức nhảy lung tung.
-4. Các đoạn liền nhau có cùng mức được gộp thành một **giai đoạn**.
-5. Mức của cả video là mức cao nhất trong các giai đoạn.
+4. **Giữ mức** (`LEVEL_HOLD_SECONDS`, mặc định 6 giây): nước không rút trong vài giây, nên mức tăng thì đổi ngay, còn muốn giảm thì phải thấp hơn liên tục 6 giây. Cách này lấp những đoạn model sót nước vì bị người/xe che hoặc nhận nhầm. Khi đang giữ mức, thanh cảnh báo ghi "Giữ mức do vừa ngập vài giây trước". Mỗi đoạn trong `segments` có `raw_level` là mức trước khi giữ.
+   - Với camera cố định thì giữ mức luôn hợp lý. Với video cắt ghép nhiều cảnh (tin tức), mức của cảnh trước có thể bị kéo sang cảnh sau tối đa 6 giây. Đặt `LEVEL_HOLD_SECONDS=0` để tắt.
+5. Các đoạn liền nhau có cùng mức được gộp thành một **giai đoạn**.
+6. Mức của cả video là mức cao nhất trong các giai đoạn.
 
 Ngưỡng nằm trong `LEVELS` của `analyzer.py`, sửa theo thực tế. Các tham số khác chỉnh qua biến môi trường:
 
@@ -62,6 +64,7 @@ Ngưỡng nằm trong `LEVELS` của `analyzer.py`, sửa theo thực tế. Các
 | `INFER_FPS` | 5 | số lần chạy model mỗi giây video (giảm nếu máy chậm; có GPU thì đặt bằng fps của video để mượt nhất) |
 | `ROAD_MIN_FRAC` | 0.05 | đường chiếm ít nhất bao nhiêu khung hình mới coi là thấy đường |
 | `FLOOD_COVER_MIN_FRAC` | 0.10 | không thấy đường mà nước chiếm ít nhất bao nhiêu khung hình thì coi là đường bị phủ kín |
+| `LEVEL_HOLD_SECONDS` | 6 | mức chỉ được giảm khi đã thấp hơn liên tục bấy nhiêu giây (0 = tắt) |
 | `MASK_SMOOTH` | 0.6 | mức làm mượt mask flood/road (0 = tắt, càng lớn càng mượt nhưng trễ hơn) |
 | `CAR_HISTORY` | 7 | số lần chạy gần nhất dùng để chốt level xe |
 | `SEGMENT_SECONDS` | 2 | độ dài mỗi đoạn tính mức |
