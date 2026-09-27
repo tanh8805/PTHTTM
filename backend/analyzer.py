@@ -8,6 +8,7 @@ import sys
 import json
 import threading
 import unicodedata
+from collections import Counter, deque
 from functools import lru_cache
 from pathlib import Path
 
@@ -23,6 +24,8 @@ IMG_SIZE = int(os.getenv("IMG_SIZE", "640"))
 INFER_FPS = float(os.getenv("INFER_FPS", "5"))        # số lần chạy model mỗi giây video; khung hình ở giữa dùng lại mask gần nhất
 SEGMENT_SECONDS = float(os.getenv("SEGMENT_SECONDS", "2"))  # độ dài mỗi đoạn để tính mức cảnh báo
 MIN_FRAME_FRAC = float(os.getenv("MIN_FRAME_FRAC", "0.5"))  # mức của đoạn = mức cao nhất mà >= 50% khung hình trong đoạn đạt
+MASK_SMOOTH = float(os.getenv("MASK_SMOOTH", "0.6"))  # trọng số lịch sử khi làm mượt mask flood/road giữa các lần chạy model (0 = tắt)
+CAR_HISTORY = int(os.getenv("CAR_HISTORY", "7"))       # level xe = level xuất hiện nhiều nhất trong 7 lần chạy model gần nhất
 OUT_WIDTH = int(os.getenv("OUT_WIDTH", "960"))        # chiều rộng video kết quả (thu nhỏ cho nhẹ)
 MAX_SECONDS = float(os.getenv("MAX_SECONDS", "600"))  # chỉ xử lý tối đa 10 phút đầu
 
@@ -115,13 +118,12 @@ def frame_stats(instances, h, w):
     flood_px, road_px = int(flood.sum()), int(road.sum())
     # Tỉ lệ ngập so với mặt đường nhìn thấy; thấy quá ít đường (đường ngập hết hoặc model
     # không nhận ra) thì so với cả khung hình, tránh vũng nước nhỏ thành tỉ lệ 100%.
-    if road_px >= 0.05 * h * w:
-        flood_ratio = flood_px / (flood_px + road_px)
-    else:
-        flood_ratio = flood_px / (h * w)
+    road_visible = road_px >= 0.05 * h * w
+    flood_ratio = flood_px / (flood_px + road_px) if road_visible else flood_px / (h * w)
     max_car = max(cars, default=None)
     return {
         "flood_ratio": round(flood_ratio, 3),
+        "road_visible": road_visible,
         "cars": len(cars),
         "max_car_level": max_car,
         "level": level_of(flood_ratio, max_car),
@@ -138,22 +140,110 @@ def max_or_none(values):
     return max(values) if values else None
 
 
+# ---------------- Làm mượt theo thời gian ----------------
+
+def box_iou(a, b):
+    ix = max(0, min(a[2], b[2]) - max(a[0], b[0]))
+    iy = max(0, min(a[3], b[3]) - max(a[1], b[1]))
+    inter = ix * iy
+    union = (a[2] - a[0]) * (a[3] - a[1]) + (b[2] - b[0]) * (b[3] - b[1]) - inter
+    return inter / union if union > 0 else 0.0
+
+
+class CarTracker:
+    """Nối xe giữa các lần chạy model theo IoU box: level lấy theo đa số gần đây,
+    xe bị sót 1 lần vẫn giữ lại để không nhấp nháy."""
+
+    def __init__(self, min_iou=0.3, hold=1):
+        self.tracks, self.min_iou, self.hold = [], min_iou, hold
+
+    def update(self, cars):
+        pairs = sorted(((box_iou(t["inst"]["box"], c["box"]), ti, ci)
+                        for ti, t in enumerate(self.tracks) for ci, c in enumerate(cars)), reverse=True)
+        t2c, c2t = {}, {}
+        for iou, ti, ci in pairs:
+            if iou < self.min_iou:
+                break
+            if ti not in t2c and ci not in c2t:
+                t2c[ti], c2t[ci] = ci, ti
+        tracks = []
+        for ti, t in enumerate(self.tracks):
+            if ti in t2c:
+                t["inst"], t["missed"] = cars[t2c[ti]], 0
+                t["levels"].append(t["inst"]["level"])
+            else:
+                t["missed"] += 1
+            if t["missed"] <= self.hold:
+                tracks.append(t)
+        for ci, c in enumerate(cars):
+            if ci not in c2t:
+                tracks.append({"inst": c, "missed": 0, "levels": deque([c["level"]], maxlen=CAR_HISTORY)})
+        self.tracks = tracks
+        out = []
+        for t in tracks:
+            counts = Counter(t["levels"])
+            level = max(counts, key=lambda lv: (counts[lv], lv))  # hòa thì lấy level cao hơn cho an toàn
+            out.append({**t["inst"], "level": level})
+        return out
+
+
+class TemporalSmoother:
+    """flood/road: trung bình trượt mask + ngưỡng trễ (bật khi > 0.5, chỉ tắt khi < 0.25) để vùng không
+    nhấp nháy khi model lúc thấy lúc không; xe: CarTracker."""
+
+    def __init__(self, on=0.5, off=0.25):
+        self.maps, self.state = {}, {}
+        self.on, self.off = on, off
+        self.cars = CarTracker()
+
+    def update(self, instances, h, w):
+        out = []
+        for kind in ("road", "flood"):
+            cur = np.zeros((h, w), np.float32)
+            for inst in instances:
+                if inst["kind"] == kind:
+                    cur[inst["mask"]] = 1.0
+            if MASK_SMOOTH > 0 and kind in self.maps:
+                cur = (1 - MASK_SMOOTH) * cur + MASK_SMOOTH * self.maps[kind]
+            self.maps[kind] = cur
+            mask = cur > self.on
+            if MASK_SMOOTH > 0 and kind in self.state:
+                mask |= self.state[kind] & (cur > self.off)
+            self.state[kind] = mask
+            if mask.any():
+                out.append({"kind": kind, "level": None, "conf": 1.0, "mask": mask, "box": None})
+        return out + self.cars.update([i for i in instances if i["kind"] == "car"])
+
+
 # ---------------- Vẽ lên video ----------------
 
 def _find_font():
-    candidates = [
-        os.getenv("FONT_PATH", ""),
-        "C:/Windows/Fonts/arialbd.ttf", "C:/Windows/Fonts/arial.ttf", "C:/Windows/Fonts/segoeui.ttf",
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-        "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
-        "/System/Library/Fonts/Supplemental/Arial Bold.ttf", "/Library/Fonts/Arial Unicode.ttf",
-    ]
+    env = os.getenv("FONT_PATH", "")
+    if env and Path(env).exists():
+        return env
+    # matplotlib (luôn được cài cùng ultralytics) có sẵn DejaVu Sans, hiển thị đủ dấu tiếng Việt
     try:
-        from ultralytics.utils import USER_CONFIG_DIR
-        candidates += [str(USER_CONFIG_DIR / "Arial.Unicode.ttf"), str(USER_CONFIG_DIR / "Arial.ttf")]
+        import matplotlib
+        p = Path(matplotlib.get_data_path()) / "fonts" / "ttf" / "DejaVuSans-Bold.ttf"
+        if p.exists():
+            return str(p)
     except Exception:
         pass
-    return next((c for c in candidates if c and Path(c).exists()), None)
+    candidates = [
+        "C:/Windows/Fonts/arialbd.ttf", "C:/Windows/Fonts/arial.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", "/usr/share/fonts/TTF/DejaVuSans-Bold.ttf",
+        "/System/Library/Fonts/Supplemental/Arial Bold.ttf",
+    ]
+    return next((c for c in candidates if Path(c).exists()), None)
+
+
+def _font(size):
+    if FONT_FILE:
+        return ImageFont.truetype(FONT_FILE, size)
+    try:
+        return ImageFont.load_default(size)  # Pillow >= 10.1
+    except TypeError:
+        return ImageFont.load_default()
 
 
 FONT_FILE = _find_font()
@@ -175,29 +265,31 @@ def banner(width, level, line2):
     b, g, r = LEVELS[level][4]
     img = Image.new("RGB", (width, height), (r, g, b))
     draw = ImageDraw.Draw(img)
-    big = ImageFont.truetype(FONT_FILE, int(30 * scale)) if FONT_FILE else ImageFont.load_default()
-    small = ImageFont.truetype(FONT_FILE, int(18 * scale)) if FONT_FILE else ImageFont.load_default()
+    big = _font(int(30 * scale))
+    small = _font(int(18 * scale))
     draw.text((int(14 * scale), int(5 * scale)), vn_text(f"MỨC {level}: {LEVELS[level][1].upper()}"), font=big, fill=(255, 255, 255))
     draw.text((int(14 * scale), int(42 * scale)), vn_text(line2), font=small, fill=(255, 255, 255))
     return cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
 
 
 def build_overlay(instances, h, w):
-    """Chuẩn bị lớp màu mask + viền + nhãn xe; dùng lại cho các khung hình tới lần chạy model kế tiếp."""
-    color = np.zeros((h, w, 3), np.uint8)
-    area = np.zeros((h, w), bool)
-    contours, labels = [], []
+    """Lớp màu mask + viền + nhãn xe của một lần chạy model; tách vùng (flood/road) và xe."""
+    ov = {"area_color": np.zeros((h, w, 3), np.uint8), "area": np.zeros((h, w), bool),
+          "car_color": np.zeros((h, w, 3), np.uint8), "car": np.zeros((h, w), bool),
+          "contours": [], "labels": []}
     order = {"road": 0, "flood": 1, "car": 2}  # vẽ xe sau cùng để nằm trên nước/đường
     for inst in sorted(instances, key=lambda i: order[i["kind"]]):
-        name = f"car_L{inst['level']}" if inst["kind"] == "car" else inst["kind"]
+        is_car = inst["kind"] == "car"
+        name = f"car_L{inst['level']}" if is_car else inst["kind"]
         col = CLASS_COLORS[name]
-        color[inst["mask"]] = col
-        area |= inst["mask"]
+        prefix = "car" if is_car else "area"
+        ov[prefix + "_color"][inst["mask"]] = col
+        ov[prefix] |= inst["mask"]
         cs, _ = cv2.findContours(inst["mask"].astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        contours.append((cs, col))
-        if inst["kind"] == "car":
-            labels.append((f"L{inst['level']} {inst['conf']:.2f}", tuple(inst["box"][:2]), col))
-    return color, area, contours, labels
+        ov["contours"].append((cs, col))
+        if is_car:
+            ov["labels"].append((f"L{inst['level']} {inst['conf']:.2f}", tuple(inst["box"][:2]), col))
+    return ov
 
 
 def draw_legend(img):
@@ -210,21 +302,33 @@ def draw_legend(img):
         cv2.putText(img, name, (32, y + 13), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1, cv2.LINE_AA)
 
 
-def render_frame(frame, overlay, level, stats):
-    out = frame.copy()
-    if overlay is not None:
-        color, area, contours, labels = overlay
-        out[area] = (out[area] * 0.5 + color[area] * 0.5).astype(np.uint8)
-        for cs, col in contours:
-            cv2.drawContours(out, cs, -1, col, 2)
-        for text, (x, y), col in labels:
-            (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
-            y = max(y, th + 4)
-            cv2.rectangle(out, (x, y - th - 4), (x + tw + 4, y), col, -1)
-            cv2.putText(out, text, (x + 2, y - 3), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1, cv2.LINE_AA)
+def render_frame(frame, ov_a, ov_b, t, level, stats):
+    """Vẽ khung hình nằm giữa 2 lần chạy model: vùng flood/road hòa trộn dần từ ov_a sang ov_b
+    (t = 0..1) để mask không đứng yên rồi nhảy; xe, viền, nhãn lấy theo lần chạy gần hơn."""
+    near = ov_a if t < 0.5 else ov_b
+    if ov_a is ov_b or t == 0:
+        out = frame.copy()
+        m = ov_a["area"]
+        out[m] = (out[m] * 0.5 + ov_a["area_color"][m] * 0.5).astype(np.uint8)
+    else:
+        wa = ov_a["area"].astype(np.float32) * (1 - t)
+        wb = ov_b["area"].astype(np.float32) * t
+        alpha = (0.5 * (wa + wb))[..., None]
+        color = ov_a["area_color"] * wa[..., None] + ov_b["area_color"] * wb[..., None]
+        out = (frame * (1 - alpha) + 0.5 * color).astype(np.uint8)
+    m = near["car"]
+    out[m] = (out[m] * 0.5 + near["car_color"][m] * 0.5).astype(np.uint8)
+    for cs, col in near["contours"]:
+        cv2.drawContours(out, cs, -1, col, 2)
+    for text, (x, y), col in near["labels"]:
+        (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+        y = max(y, th + 4)
+        cv2.rectangle(out, (x, y - th - 4), (x + tw + 4, y), col, -1)
+        cv2.putText(out, text, (x + 2, y - 3), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1, cv2.LINE_AA)
     draw_legend(out)
     car = "không có xe" if stats["max_car_level"] is None else f"L{stats['max_car_level']}"
-    top = banner(out.shape[1], level, f"Ngập {stats['flood_ratio']:.0%} mặt đường · Xe ngập cao nhất: {car}")
+    base = "mặt đường" if stats["road_visible"] else "khung hình (không thấy đường)"
+    top = banner(out.shape[1], level, f"Ngập {stats['flood_ratio']:.0%} {base} · Xe ngập cao nhất: {car}")
     return np.vstack([top, out])
 
 
@@ -257,29 +361,43 @@ def process_video(video_path, out_path, progress=None):
     infer_every = max(1, round(fps / INFER_FPS))
     seg_len = max(infer_every, round(SEGMENT_SECONDS * fps))
 
-    frames, segments = [], []
-    buf, seg_stats = [], []   # khung hình của đoạn hiện tại (chờ biết mức của đoạn rồi mới ghi)
-    overlay, stats = None, None
+    frames, kf_index, segments = [], [], []   # số liệu từng lần chạy model + chỉ số khung hình tương ứng
+    buf = []       # khung hình đã sẵn overlay của đoạn hiện tại (chờ biết mức của đoạn rồi mới ghi)
+    pending = []   # khung hình từ lần chạy model trước tới trước lần chạy kế tiếp (chờ để hòa trộn mask)
+    prev = None    # (overlay, stats) của lần chạy model trước
+    smoother = TemporalSmoother()
     writer = open_writer(out_path, w, h + banner(w, 0, "").shape[0], fps)
     idx = seg_start = 0
 
-    def flush():
+    def flush(end):
         nonlocal seg_start
         if not buf:
             return
-        cur = seg_stats or [stats]
+        cur = [f for f, i in zip(frames, kf_index) if seg_start <= i < end]
+        if not cur:
+            cur = [max(((f, i) for f, i in zip(frames, kf_index) if i < end), key=lambda x: x[1])[0]]
         level = segment_level(cur)
         segments.append({
-            "start_s": round(seg_start / fps, 2), "end_s": round(idx / fps, 2),
+            "start_s": round(seg_start / fps, 2), "end_s": round(end / fps, 2),
             "level": level, "warning": LEVELS[level][1],
             "flood_ratio_max": max(s["flood_ratio"] for s in cur),
             "car_level_max": max_or_none(s["max_car_level"] for s in cur),
         })
-        for frame, ov, st in buf:
-            writer.send(np.ascontiguousarray(render_frame(frame, ov, level, st)))
+        for frame, ov_a, ov_b, t, st in buf:
+            writer.send(np.ascontiguousarray(render_frame(frame, ov_a, ov_b, t, level, st)))
         buf.clear()
-        seg_stats.clear()
-        seg_start = idx
+        seg_start = end
+
+    def emit(nxt):
+        """Chuyển các khung hình đang chờ vào đoạn, hòa trộn từ lần chạy trước (prev) tới lần chạy mới (nxt)."""
+        n = len(pending)
+        for j, (i, frame) in enumerate(pending):
+            if i and i % seg_len == 0:
+                flush(i)
+            t = j / n
+            st = prev[1] if t < 0.5 else nxt[1]
+            buf.append((frame, prev[0], nxt[0], t, st))
+        pending.clear()
 
     with _lock:  # model YOLO không an toàn khi nhiều video dùng cùng lúc
         try:
@@ -290,18 +408,21 @@ def process_video(video_path, out_path, progress=None):
                 frame = cv2.resize(frame, (w, h), interpolation=cv2.INTER_AREA)
                 if idx % infer_every == 0:
                     r = model.predict(frame, conf=CONF, imgsz=IMG_SIZE, retina_masks=True, verbose=False)[0]
-                    instances = parse_result(r, cmap)
+                    instances = smoother.update(parse_result(r, cmap), h, w)
                     stats = {"time_s": round(idx / fps, 2), **frame_stats(instances, h, w)}
                     frames.append(stats)
-                    seg_stats.append(stats)
-                    overlay = build_overlay(instances, h, w)
-                buf.append((frame, overlay, stats))
+                    kf_index.append(idx)
+                    cur = (build_overlay(instances, h, w), stats)
+                    if prev is not None:
+                        emit(cur)
+                    prev = cur
+                pending.append((idx, frame))
                 idx += 1
-                if idx % seg_len == 0:
-                    flush()
                 if progress:
                     progress(min(idx / total, 0.99))
-            flush()
+            if prev is not None:
+                emit(prev)
+                flush(idx)
         finally:
             cap.release()
             writer.close()

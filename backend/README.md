@@ -31,7 +31,10 @@ uvicorn app:app --host 0.0.0.0 --port 8000
 
 ## Cách tính mức cảnh báo
 
-1. Chạy model 5 lần mỗi giây video (`INFER_FPS`) với conf 0.5. Các khung hình ở giữa dùng lại mask gần nhất.
+1. Chạy model 5 lần mỗi giây video (`INFER_FPS`) với conf 0.5, rồi làm mượt theo thời gian để mask không giật:
+   - **flood/road**: lấy trung bình trượt của mask qua các lần chạy, có ngưỡng trễ (bật khi > 0.5, chỉ tắt khi < 0.25). Một vùng chỉ hiện nhầm trong 1 lần chạy sẽ không hiện ra; một vùng thật bị sót 1 lần vẫn được giữ.
+   - **xe**: nối xe giữa các lần chạy theo IoU box. Level là level xuất hiện nhiều nhất trong 7 lần gần nhất (hòa thì lấy level cao hơn). Xe bị sót 1 lần vẫn được giữ lại.
+   - **khung hình ở giữa 2 lần chạy**: mask flood/road chuyển dần từ lần chạy trước sang lần chạy sau, thay vì đứng yên rồi nhảy.
 2. Với mỗi khung hình được chạy model:
    - `flood_ratio` = diện tích flood / (flood + road). Nếu thấy ít đường (< 5% khung hình) thì chia cho cả khung hình.
    - `max_car_level` = level cao nhất của xe (car_L0…car_L4; level càng cao thì nước càng sâu).
@@ -54,7 +57,9 @@ Ngưỡng nằm trong `LEVELS` của `analyzer.py`, sửa theo thực tế. Các
 |---|---|---|
 | `MODEL_PATH` | `weights/best.pt` | đường dẫn model |
 | `CONF` | 0.5 | confidence tối thiểu |
-| `INFER_FPS` | 5 | số lần chạy model mỗi giây video (giảm xuống nếu máy chậm) |
+| `INFER_FPS` | 5 | số lần chạy model mỗi giây video (giảm nếu máy chậm; có GPU thì đặt bằng fps của video để mượt nhất) |
+| `MASK_SMOOTH` | 0.6 | mức làm mượt mask flood/road (0 = tắt, càng lớn càng mượt nhưng trễ hơn) |
+| `CAR_HISTORY` | 7 | số lần chạy gần nhất dùng để chốt level xe |
 | `SEGMENT_SECONDS` | 2 | độ dài mỗi đoạn tính mức |
 | `MIN_FRAME_FRAC` | 0.5 | tỉ lệ khung hình tối thiểu để một đoạn đạt mức |
 | `OUT_WIDTH` | 960 | chiều rộng video kết quả |
