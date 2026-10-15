@@ -1,7 +1,7 @@
 # Backend cảnh báo ngập từ video
 
 Upload video camera đường phố, nhận lại:
-- **Video segmentation**: mask từng class (flood, road, car_L0…car_L4) vẽ lên video, kèm thanh cảnh báo phía trên đổi màu theo mức.
+- **Video segmentation**: mask từng class (flood, road, car_dry, car_shallow, car_deep) vẽ lên video, kèm thanh cảnh báo phía trên đổi màu theo mức.
 - **Mức cảnh báo theo từng giai đoạn** (ví dụ 0–12s An toàn, 12–30s Cảnh báo…), cùng mức cao nhất của cả video.
 
 Model là `best.pt` từ `train.ipynb`.
@@ -39,15 +39,15 @@ uvicorn app:app --host 0.0.0.0 --port 8000
    - `flood_ratio` = diện tích flood / (flood + road). Khi thấy rất ít đường (< 5% khung hình):
      - nếu nước chiếm ≥ 10% khung hình thì coi như đường đã bị nước phủ kín, vẫn chia cho (flood + road), ra gần 100%;
      - nếu nước ít hơn thì chỉ là vũng nước (model sót đường), chia cho cả khung hình để vũng nhỏ không thành 100%.
-   - `max_car_level` = level cao nhất của xe (car_L0…car_L4; level càng cao thì nước càng sâu).
+   - `max_car_level` = level cao nhất của xe: `car_dry` = 0, `car_shallow` = 2, `car_deep` = 3 (level càng cao thì nước càng sâu; giao diện hiển thị Khô / Nông / Sâu). Model cũ với `car_L0…car_L4` vẫn đọc được.
    - Khung hình đạt một mức nếu thỏa **một trong hai** điều kiện:
 
    | Mức | Tên | flood_ratio ≥ | hoặc xe ≥ |
    |---|---|---|---|
    | 0 | An toàn | – | – |
-   | 1 | Chú ý | 0.05 | L1 |
-   | 2 | Cảnh báo | 0.30 | L2 |
-   | 3 | Nguy hiểm | 0.60 | L3 |
+   | 1 | Chú ý | 0.05 | level 1 |
+   | 2 | Cảnh báo | 0.30 | level 2 (`car_shallow`) |
+   | 3 | Nguy hiểm | 0.60 | level 3 (`car_deep`) |
 
 3. Chia video thành từng **đoạn 2 giây** (`SEGMENT_SECONDS`). Mức của một đoạn là mức cao nhất mà ít nhất 50% khung hình trong đoạn đạt được. Cách này giúp vài khung hình nhận nhầm không làm mức nhảy lung tung.
 4. **Giữ mức** (`LEVEL_HOLD_SECONDS`, mặc định 6 giây): nước không rút trong vài giây, nên mức tăng thì đổi ngay, còn muốn giảm thì phải thấp hơn liên tục 6 giây. Cách này lấp những đoạn model sót nước vì bị người/xe che hoặc nhận nhầm. Khi đang giữ mức, thanh cảnh báo ghi "Giữ mức do vừa ngập vài giây trước". Mỗi đoạn trong `segments` có `raw_level` là mức trước khi giữ.

@@ -82,11 +82,9 @@
       <b>Màu mask:</b>
       <span><i style="background:#1478e6"></i>flood</span>
       <span><i style="background:#969696"></i>road</span>
-      <span><i style="background:#50c850"></i>car_L0</span>
-      <span><i style="background:#c8dc3c"></i>car_L1</span>
-      <span><i style="background:#ffd700"></i>car_L2</span>
-      <span><i style="background:#ff8c00"></i>car_L3</span>
-      <span><i style="background:#e62828"></i>car_L4</span>
+      <span><i style="background:#50c850"></i>car_dry</span>
+      <span><i style="background:#ffd700"></i>car_shallow</span>
+      <span><i style="background:#e62828"></i>car_deep</span>
     </div>
   </div>
 </main>
@@ -95,7 +93,7 @@
 const $ = id => document.getElementById(id);
 const fmt = s => s.toFixed(1) + "s";
 const pct = r => Math.round(r * 100) + "%";
-const car = l => l === null ? "không có xe" : "L" + l;
+const car = l => l === null ? "không có xe" : l >= 3 ? "Sâu" : l >= 1 ? "Nông" : "Khô";  // level 0 / 1–2 / 3–4 = car_dry / car_shallow / car_deep
 let phases = [];
 
 async function upload() {

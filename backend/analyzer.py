@@ -1,6 +1,7 @@
 """Phân tích video camera đường phố -> video segmentation + mức cảnh báo ngập theo từng giai đoạn.
 
-Dùng model YOLO-seg đã train từ train.ipynb (class: flood, road, car_L0..car_L4).
+Dùng model YOLO-seg đã train từ train.ipynb (class: flood, road, car_dry, car_shallow, car_deep;
+vẫn đọc được model cũ với car_L0..car_L4).
 Chạy thử không cần server:  python analyzer.py video.mp4 [video_ket_qua.mp4]
 """
 import os
@@ -45,12 +46,23 @@ LEVELS = [
 CLASS_COLORS = {
     "flood": (230, 120, 20),
     "road": (150, 150, 150),
+    "car_dry": (80, 200, 80),
+    "car_shallow": (0, 215, 255),
+    "car_deep": (40, 40, 230),
     "car_L0": (80, 200, 80),
     "car_L1": (60, 220, 200),
     "car_L2": (0, 215, 255),
     "car_L3": (0, 140, 255),
     "car_L4": (40, 40, 230),
 }
+
+# Model 3 lớp xe: level xe quy về thang L0..L4 của LEVELS (khô = 0, nông = 2, sâu = 3)
+CAR_DEPTH_LEVEL = {"car_dry": 0, "car_shallow": 2, "car_deep": 3}
+LEVEL_DEPTH_NAME = {0: "car_dry", 2: "car_shallow", 3: "car_deep"}
+DEPTH_VN = {"car_dry": "Khô", "car_shallow": "Nông", "car_deep": "Sâu"}
+# True nếu model đang dùng có car_dry/car_shallow/car_deep (class_map đặt mỗi lần xử lý video).
+# Biến toàn cục: chỉ an toàn khi xử lý 1 video một lúc (max_workers=1).
+DEPTH_MODEL = False
 
 _model = None
 _lock = threading.Lock()
@@ -67,13 +79,17 @@ def get_model():
 
 def class_map(model):
     """Map class theo tên để không phụ thuộc thứ tự index: id -> (loại, level xe)."""
+    global DEPTH_MODEL
     cmap = {}
     for i, name in model.names.items():
         n = str(name).lower()
         if n in ("flood", "road"):
             cmap[int(i)] = (n, None)
+        elif n in CAR_DEPTH_LEVEL:
+            cmap[int(i)] = ("car", CAR_DEPTH_LEVEL[n])
         elif n.startswith("car_l") and n[-1].isdigit():
             cmap[int(i)] = ("car", int(n[-1]))
+    DEPTH_MODEL = any(str(n).lower() in CAR_DEPTH_LEVEL for n in model.names.values())
     if not any(kind == "flood" for kind, _ in cmap.values()):
         raise ValueError(f"Model không có class 'flood': {model.names}")
     return cmap
@@ -152,6 +168,16 @@ def held_level(raw, start_s, scene, prev_segments):
     recent = [p["raw_level"] for p in prev_segments
               if p["scene"] == scene and p["end_s"] > start_s - LEVEL_HOLD_SECONDS]
     return max([raw] + recent)
+
+
+def car_class(level):
+    """Tên class xe để chọn màu: theo model 3 lớp (khô/nông/sâu) hoặc car_L0..L4 của model cũ."""
+    return LEVEL_DEPTH_NAME.get(level, f"car_L{level}") if DEPTH_MODEL else f"car_L{level}"
+
+
+def car_text(level):
+    """Mức xe để hiển thị trên thanh cảnh báo: model 3 lớp -> Khô/Nông/Sâu; model cũ -> L0..L4."""
+    return DEPTH_VN.get(car_class(level), f"L{level}")
 
 
 def max_or_none(values):
@@ -318,7 +344,7 @@ def build_overlay(instances, h, w):
     order = {"road": 0, "flood": 1, "car": 2}  # vẽ xe sau cùng để nằm trên nước/đường
     for inst in sorted(instances, key=lambda i: order[i["kind"]]):
         is_car = inst["kind"] == "car"
-        name = f"car_L{inst['level']}" if is_car else inst["kind"]
+        name = car_class(inst["level"]) if is_car else inst["kind"]
         col = CLASS_COLORS[name]
         prefix = "car" if is_car else "area"
         ov[prefix + "_color"][inst["mask"]] = col
@@ -326,15 +352,22 @@ def build_overlay(instances, h, w):
         cs, _ = cv2.findContours(inst["mask"].astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         ov["contours"].append((cs, col))
         if is_car:
-            ov["labels"].append((f"L{inst['level']} {inst['conf']:.2f}", tuple(inst["box"][:2]), col))
+            tag = name.replace("car_", "") if DEPTH_MODEL else f"L{inst['level']}"  # nhãn OpenCV: không dấu
+            ov["labels"].append((f"{tag} {inst['conf']:.2f}", tuple(inst["box"][:2]), col))
     return ov
+
+
+def legend_classes():
+    keep = (lambda n: not n.startswith("car_L")) if DEPTH_MODEL else (lambda n: n not in CAR_DEPTH_LEVEL)
+    return {n: c for n, c in CLASS_COLORS.items() if keep(n)}
 
 
 def draw_legend(img):
     h = img.shape[0]
-    y0 = h - 10 - 20 * len(CLASS_COLORS)
-    cv2.rectangle(img, (6, y0 - 6), (118, h - 6), (0, 0, 0), -1)
-    for k, (name, col) in enumerate(CLASS_COLORS.items()):
+    classes = legend_classes()
+    y0 = h - 10 - 20 * len(classes)
+    cv2.rectangle(img, (6, y0 - 6), (130, h - 6), (0, 0, 0), -1)
+    for k, (name, col) in enumerate(classes.items()):
         y = y0 + 20 * k
         cv2.rectangle(img, (12, y + 2), (26, y + 14), col, -1)
         cv2.putText(img, name, (32, y + 13), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1, cv2.LINE_AA)
@@ -364,7 +397,7 @@ def render_frame(frame, ov_a, ov_b, t, level, stats, held=False):
         cv2.rectangle(out, (x, y - th - 4), (x + tw + 4, y), col, -1)
         cv2.putText(out, text, (x + 2, y - 3), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1, cv2.LINE_AA)
     draw_legend(out)
-    car = "không có xe" if stats["max_car_level"] is None else f"L{stats['max_car_level']}"
+    car = "không có xe" if stats["max_car_level"] is None else car_text(stats["max_car_level"])
     base = {"road": "mặt đường", "covered": "mặt đường (nước phủ kín, không còn thấy đường)",
             "frame": "khung hình (không thấy đường)"}[stats["ratio_base"]]
     line2 = f"Ngập {stats['flood_ratio']:.0%} {base} · Xe ngập cao nhất: {car}"
