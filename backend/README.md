@@ -45,9 +45,12 @@ uvicorn app:app --host 0.0.0.0 --port 8000
    | Mức | Tên | flood_ratio ≥ | hoặc xe ≥ |
    |---|---|---|---|
    | 0 | An toàn | – | – |
-   | 1 | Chú ý | 0.05 | level 1 |
+   | 1 | Chú ý | 0.05 | level 1 (model cũ car_L1) |
    | 2 | Cảnh báo | 0.30 | level 2 (`car_shallow`) |
-   | 3 | Nguy hiểm | 0.60 | level 3 (`car_deep`) |
+   | 3 | Nguy hiểm | – (không dùng độ phủ) | level 3 (`car_deep`) |
+
+   Độ phủ không phải độ sâu: nước phủ kín mặt đường vẫn có thể chỉ nông, nên độ phủ chỉ đẩy tối đa tới mức 2 (Cảnh báo). Chỉ xe ngập sâu (`car_deep`) mới lên mức 3 (Nguy hiểm).
+   Khi đoạn video không có xe nào, thanh cảnh báo và JSON (`note` ở từng đoạn/giai đoạn và ở kết quả chung) ghi "không có xe để ước lượng độ sâu", nghĩa là mức chỉ dựa vào độ phủ.
 
 3. Chia video thành từng **đoạn 2 giây** (`SEGMENT_SECONDS`). Mức của một đoạn là mức cao nhất mà ít nhất 50% khung hình trong đoạn đạt được. Cách này giúp vài khung hình nhận nhầm không làm mức nhảy lung tung.
 4. **Giữ mức** (`LEVEL_HOLD_SECONDS`, mặc định 6 giây): nước không rút trong vài giây, nên mức tăng thì đổi ngay, còn muốn giảm thì phải thấp hơn liên tục 6 giây. Cách này lấp những đoạn model sót nước vì bị người/xe che hoặc nhận nhầm. Khi đang giữ mức, thanh cảnh báo ghi "Giữ mức do vừa ngập vài giây trước". Mỗi đoạn trong `segments` có `raw_level` là mức trước khi giữ.

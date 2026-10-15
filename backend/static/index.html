@@ -85,6 +85,7 @@
       <span><i style="background:#50c850"></i>car_dry</span>
       <span><i style="background:#ffd700"></i>car_shallow</span>
       <span><i style="background:#e62828"></i>car_deep</span>
+      <div class="muted" style="margin-top:6px">Mức 1: nước ≥ 5% mặt đường · Mức 2: nước ≥ 30% hoặc có car_shallow · Mức 3 (Nguy hiểm): chỉ khi có car_deep — độ phủ không tự đẩy lên mức 3. Không có xe thì mức chỉ dựa vào độ phủ.</div>
     </div>
   </div>
 </main>
@@ -131,7 +132,7 @@ function show(job) {
   $("overall").className = "badge big lv" + r.warning_level;
   $("duration").textContent = fmt(r.duration_s);
   $("floodmax").textContent = pct(r.flood_ratio_max);
-  $("carmax").textContent = car(r.car_level_max);
+  $("carmax").textContent = car(r.car_level_max) + (r.note ? " (" + r.note + ")" : "");
   $("endtick").textContent = fmt(r.duration_s);
   $("video").src = job.video_url;
 
@@ -147,7 +148,7 @@ function show(job) {
     const tr = document.createElement("tr");
     tr.innerHTML = `<td>${fmt(p.start_s)} – ${fmt(p.end_s)}</td>
       <td><span class="badge lv${p.level}">Mức ${p.level}: ${p.warning}</span></td>
-      <td>${pct(p.flood_ratio_max)}</td><td>${car(p.car_level_max)}</td>`;
+      <td>${pct(p.flood_ratio_max)}</td><td>${car(p.car_level_max)}${p.note ? `<br><small class="muted">${p.note}</small>` : ""}</td>`;
     tr.onclick = () => seek(p.start_s);
     $("phases").appendChild(tr);
   });

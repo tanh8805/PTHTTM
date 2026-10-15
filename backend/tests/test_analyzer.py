@@ -33,18 +33,25 @@ class ClassMapTest(unittest.TestCase):
 
 
 class LevelOfTest(unittest.TestCase):
-    def test_thresholds(self):
+    def test_coverage_caps_at_level_2(self):
         self.assertEqual(A.level_of(0.0, None), 0)
-        self.assertEqual(A.level_of(0.0, 0), 0)        # car_dry alone is safe
+        self.assertEqual(A.level_of(0.04, None), 0)
         self.assertEqual(A.level_of(0.05, None), 1)
+        self.assertEqual(A.level_of(0.29, None), 1)
         self.assertEqual(A.level_of(0.30, None), 2)
-        self.assertEqual(A.level_of(0.60, None), 3)
+        self.assertEqual(A.level_of(1.00, None), 2)      # coverage alone never reaches Nguy hiểm
+        self.assertIsNone(A.LEVELS[3][2])
 
     def test_cars_by_depth_class(self):
-        self.assertEqual(A.level_of(0.0, A.CAR_DEPTH_LEVEL["car_dry"]), 0)
-        self.assertEqual(A.level_of(0.0, A.CAR_DEPTH_LEVEL["car_shallow"]), 2)   # Cảnh báo needs car >= 2
-        self.assertEqual(A.level_of(0.0, A.CAR_DEPTH_LEVEL["car_deep"]), 3)      # Nguy hiểm needs car >= 3
-        self.assertEqual(A.level_of(0.40, A.CAR_DEPTH_LEVEL["car_dry"]), 2)      # either condition is enough
+        self.assertEqual(A.level_of(0.0, A.CAR_DEPTH_LEVEL["car_dry"]), 0)     # car_dry alone is safe
+        self.assertEqual(A.level_of(0.0, A.CAR_DEPTH_LEVEL["car_shallow"]), 2)
+        self.assertEqual(A.level_of(0.0, A.CAR_DEPTH_LEVEL["car_deep"]), 3)    # only car_deep -> Nguy hiểm
+        self.assertEqual(A.level_of(0.40, A.CAR_DEPTH_LEVEL["car_dry"]), 2)    # coverage still counts with a dry car
+        self.assertEqual(A.level_of(1.00, A.CAR_DEPTH_LEVEL["car_shallow"]), 2)
+        self.assertEqual(A.level_of(0.10, A.CAR_DEPTH_LEVEL["car_deep"]), 3)
+
+    def test_legacy_levels(self):
+        self.assertEqual([A.level_of(0.0, k) for k in range(5)], [0, 1, 2, 3, 3])
 
 
 class RenderNamesTest(unittest.TestCase):
@@ -58,6 +65,19 @@ class RenderNamesTest(unittest.TestCase):
         A.class_map(model(["flood", "road", "car_L0", "car_L3"]))
         self.assertEqual(A.car_text(3), "L3")
         self.assertEqual(len(A.legend_classes()), 7)
+
+
+class NoCarNoteTest(unittest.TestCase):
+    def test_banner_and_json_note(self):
+        import numpy as np
+        h = w = 100
+        flood = np.ones((h, w), bool)
+        st = A.frame_stats([{"kind": "flood", "level": None, "conf": 1, "mask": flood, "box": None}], h, w)
+        self.assertEqual((st["level"], st["max_car_level"]), (2, None))    # fully covered road, no car: level 2, not 3
+        ov = A.build_overlay([{"kind": "flood", "level": None, "conf": 1, "mask": flood, "box": None}], h, w)
+        out = A.render_frame(np.zeros((h, w, 3), np.uint8), ov, ov, 0, 2, st, no_car=True)
+        self.assertEqual(out.shape[1], w)
+        self.assertEqual(A.NO_CAR_NOTE, "không có xe để ước lượng độ sâu")
 
 
 class FrameStatsTest(unittest.TestCase):

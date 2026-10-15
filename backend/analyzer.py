@@ -36,12 +36,15 @@ MAX_SECONDS = float(os.getenv("MAX_SECONDS", "600"))  # chỉ xử lý tối đa
 
 # Mức cảnh báo: (mã, tên, tỉ lệ ngập mặt đường tối thiểu, level xe tối thiểu, màu BGR)
 # Một khung hình đạt mức nếu thỏa ĐIỀU KIỆN NGẬP HOẶC ĐIỀU KIỆN XE.
+# Độ phủ (flood/road) không phải độ sâu: nó chỉ đẩy tới tối đa mức 2; mức 3 (Nguy hiểm) chỉ do xe ngập sâu
+# (car_deep) nên không có ngưỡng độ phủ (None).
 LEVELS = [
     (0, "An toàn", 0.00, 0, (70, 160, 40)),
     (1, "Chú ý", 0.05, 1, (0, 185, 235)),
     (2, "Cảnh báo", 0.30, 2, (0, 120, 245)),
-    (3, "Nguy hiểm", 0.60, 3, (40, 30, 210)),
+    (3, "Nguy hiểm", None, 3, (40, 30, 210)),
 ]
+NO_CAR_NOTE = "không có xe để ước lượng độ sâu"
 # Màu từng class (BGR) khi vẽ mask
 CLASS_COLORS = {
     "flood": (230, 120, 20),
@@ -118,7 +121,7 @@ def parse_result(result, cmap):
 def level_of(flood_ratio, max_car):
     level = 0
     for code, _, min_ratio, min_car, _ in LEVELS[1:]:
-        if flood_ratio >= min_ratio or (max_car is not None and max_car >= min_car):
+        if (min_ratio is not None and flood_ratio >= min_ratio) or (max_car is not None and max_car >= min_car):
             level = code
     return level
 
@@ -373,7 +376,7 @@ def draw_legend(img):
         cv2.putText(img, name, (32, y + 13), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1, cv2.LINE_AA)
 
 
-def render_frame(frame, ov_a, ov_b, t, level, stats, held=False):
+def render_frame(frame, ov_a, ov_b, t, level, stats, held=False, no_car=False):
     """Vẽ khung hình nằm giữa 2 lần chạy model: vùng flood/road hòa trộn dần từ ov_a sang ov_b
     (t = 0..1) để mask không đứng yên rồi nhảy; xe, viền, nhãn lấy theo lần chạy gần hơn."""
     near = ov_a if t < 0.5 else ov_b
@@ -398,9 +401,8 @@ def render_frame(frame, ov_a, ov_b, t, level, stats, held=False):
         cv2.putText(out, text, (x + 2, y - 3), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1, cv2.LINE_AA)
     draw_legend(out)
     car = "không có xe" if stats["max_car_level"] is None else car_text(stats["max_car_level"])
-    base = {"road": "mặt đường", "covered": "mặt đường (nước phủ kín, không còn thấy đường)",
-            "frame": "khung hình (không thấy đường)"}[stats["ratio_base"]]
-    line2 = f"Ngập {stats['flood_ratio']:.0%} {base} · Xe ngập cao nhất: {car}"
+    base = {"road": "mặt đường", "covered": "mặt đường (đã phủ kín)", "frame": "khung hình (không thấy đường)"}[stats["ratio_base"]]
+    line2 = f"Ngập {stats['flood_ratio']:.0%} {base} · " + (NO_CAR_NOTE if no_car else f"Xe ngập cao nhất: {car}")
     if held:
         line2 = f"Giữ mức do vừa ngập vài giây trước · hiện thấy: ngập {stats['flood_ratio']:.0%}, xe: {car}"
     top = banner(out.shape[1], level, line2)
@@ -455,15 +457,17 @@ def process_video(video_path, out_path, progress=None):
             cur = [max(((f, i) for f, i in zip(frames, kf_index) if i < end), key=lambda x: x[1])[0]]
         raw = segment_level(cur)
         seg_scene = cur[-1]["scene"]
+        no_car = all(s["max_car_level"] is None for s in cur)
         level = held_level(raw, round(seg_start / fps, 2), seg_scene, segments)
         segments.append({
             "start_s": round(seg_start / fps, 2), "end_s": round(end / fps, 2),
             "level": level, "warning": LEVELS[level][1], "raw_level": raw, "scene": seg_scene,
             "flood_ratio_max": max(s["flood_ratio"] for s in cur),
             "car_level_max": max_or_none(s["max_car_level"] for s in cur),
+            "note": NO_CAR_NOTE if no_car else None,
         })
         for frame, ov_a, ov_b, t, st in buf:
-            writer.send(np.ascontiguousarray(render_frame(frame, ov_a, ov_b, t, level, st, held=level > raw)))
+            writer.send(np.ascontiguousarray(render_frame(frame, ov_a, ov_b, t, level, st, held=level > raw, no_car=no_car)))
         buf.clear()
         seg_start = end
 
@@ -522,6 +526,7 @@ def process_video(video_path, out_path, progress=None):
             p["end_s"] = s["end_s"]
             p["flood_ratio_max"] = max(p["flood_ratio_max"], s["flood_ratio_max"])
             p["car_level_max"] = max_or_none([p["car_level_max"], s["car_level_max"]])
+            p["note"] = NO_CAR_NOTE if p["car_level_max"] is None else None
         else:
             phases.append(dict(s))
     level = max(s["level"] for s in segments)
@@ -534,6 +539,7 @@ def process_video(video_path, out_path, progress=None):
                               for c in range(len(LEVELS))},
         "flood_ratio_max": max(f["flood_ratio"] for f in frames),
         "car_level_max": max_or_none(f["max_car_level"] for f in frames),
+        "note": NO_CAR_NOTE if all(f["max_car_level"] is None for f in frames) else None,
         "scene_cuts": [f["time_s"] for k, f in enumerate(frames) if k and f["scene"] != frames[k - 1]["scene"]],
         "phases": phases,
         "segments": segments,
